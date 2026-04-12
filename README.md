@@ -248,7 +248,7 @@ D:\Backup\
 
 ## 许可证
 
-Copyright © 2024
+MIT License
 
 ## 更新日志
 
