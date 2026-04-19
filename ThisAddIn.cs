@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -17,8 +17,11 @@ namespace ppt_copier_addin
         private string configFilePath;
         private string stateFilePath;
         private string logFolderPath;
+        private string fallbackBackupPath;
         private Dictionary<string, List<string>> fileState;
         private readonly object stateLock = new object();
+        private string currentDateFolder;  // 记录当前日期文件夹
+        private DateTime lastDateCheck;    // 上次日期检查时间
 
         // 默认日志保留天数
         private const int DefaultLogRetentionDays = 7;
@@ -33,17 +36,22 @@ namespace ppt_copier_addin
                 configFilePath = Path.Combine(appDataFolder, "config.json");
                 stateFilePath = Path.Combine(appDataFolder, "state.json");
                 logFolderPath = Path.Combine(appDataFolder, "Logs");
+                fallbackBackupPath = Path.Combine(appDataFolder, "Backup");
 
                 // 确保目录存在
                 Directory.CreateDirectory(appDataFolder);
                 Directory.CreateDirectory(logFolderPath);
+
+                // 初始化日期跟踪
+                currentDateFolder = DateTime.Now.ToString("yyyy-MM-dd");
+                lastDateCheck = DateTime.Now;
 
                 // 创建默认配置文件（如果不存在）
                 CreateDefaultConfigIfNotExists();
 
                 // 读取配置，获取日志保留天数
                 int logRetentionDays = GetLogRetentionDays();
-                
+
                 // 清理旧日志（只在启动时执行一次）
                 CleanOldLogs(logRetentionDays);
 
@@ -54,8 +62,13 @@ namespace ppt_copier_addin
                 // 加载状态文件
                 LoadStateFile();
 
+                // 清理过期的状态记录
+                CleanExpiredStateRecords(logRetentionDays);
+
                 LogMessage("PowerPoint自动复制插件已启动");
                 LogMessage($"日志保留天数: {logRetentionDays}天，已清理过期日志");
+                LogMessage($"回退备份路径: {fallbackBackupPath}");
+                LogMessage($"当前日期文件夹: {currentDateFolder}");
             }
             catch (Exception ex)
             {
@@ -82,6 +95,70 @@ namespace ppt_copier_addin
             }
         }
 
+        /// <summary>
+        /// 检查并更新日期文件夹（跨天处理）
+        /// </summary>
+        private void CheckAndUpdateDateFolder()
+        {
+            DateTime now = DateTime.Now;
+
+            // 如果日期改变了
+            if (now.Date != lastDateCheck.Date)
+            {
+                string newDateFolder = now.ToString("yyyy-MM-dd");
+                LogMessage($"检测到日期变更: {currentDateFolder} -> {newDateFolder}");
+                currentDateFolder = newDateFolder;
+                lastDateCheck = now;
+            }
+        }
+
+        /// <summary>
+        /// 清理过期的状态记录
+        /// </summary>
+        private void CleanExpiredStateRecords(int retentionDays)
+        {
+            try
+            {
+                lock (stateLock)
+                {
+                    if (fileState == null || fileState.Count == 0)
+                        return;
+
+                    DateTime cutoffDate = DateTime.Now.AddDays(-retentionDays);
+                    var keysToRemove = new List<string>();
+
+                    foreach (var key in fileState.Keys)
+                    {
+                        // 从key中提取日期部分（格式：yyyy-MM-dd_filename）
+                        string datePart = key.Split('_')[0];
+                        if (DateTime.TryParse(datePart, out DateTime fileDate))
+                        {
+                            if (fileDate < cutoffDate)
+                            {
+                                keysToRemove.Add(key);
+                            }
+                        }
+                    }
+
+                    foreach (var key in keysToRemove)
+                    {
+                        fileState.Remove(key);
+                        LogMessage($"移除过期状态记录: {key}");
+                    }
+
+                    if (keysToRemove.Count > 0)
+                    {
+                        SaveStateFile();
+                        LogMessage($"已清理 {keysToRemove.Count} 条过期状态记录");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"清理过期状态记录失败: {ex.Message}");
+            }
+        }
+
         private void CreateDefaultConfigIfNotExists()
         {
             if (!File.Exists(configFilePath))
@@ -92,7 +169,8 @@ namespace ppt_copier_addin
                     EnableLogging = true,
                     EnableAutoCopy = true,
                     DateFolderFormat = "yyyy-MM-dd",
-                    LogRetentionDays = 7
+                    LogRetentionDays = 7,
+                    UseFallbackOnError = true
                 };
 
                 string json = JsonConvert.SerializeObject(defaultConfig, Formatting.Indented);
@@ -169,6 +247,53 @@ namespace ppt_copier_addin
             }
         }
 
+        /// <summary>
+        /// 验证并获取可用的目标路径
+        /// </summary>
+        private string GetAvailableTargetPath(string configuredPath, bool useFallback)
+        {
+            // 首先检查配置的路径
+            if (!string.IsNullOrEmpty(configuredPath))
+            {
+                try
+                {
+                    // 测试写入权限
+                    string testFile = Path.Combine(configuredPath, ".write_test");
+                    Directory.CreateDirectory(configuredPath);
+                    File.WriteAllText(testFile, "test");
+                    File.Delete(testFile);
+
+                    LogMessage($"目标路径可用: {configuredPath}");
+                    return configuredPath;
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"目标路径不可写入: {configuredPath}, 错误: {ex.Message}");
+                }
+            }
+
+            // 如果配置路径不可用且允许回退，则使用回退路径
+            if (useFallback)
+            {
+                try
+                {
+                    Directory.CreateDirectory(fallbackBackupPath);
+                    string testFile = Path.Combine(fallbackBackupPath, ".write_test");
+                    File.WriteAllText(testFile, "test");
+                    File.Delete(testFile);
+
+                    LogMessage($"使用回退路径: {fallbackBackupPath}");
+                    return fallbackBackupPath;
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"回退路径也不可写入: {fallbackBackupPath}, 错误: {ex.Message}");
+                }
+            }
+
+            return null;
+        }
+
         private async void Application_AfterPresentationOpen(PowerPoint.Presentation Pres)
         {
             await HandlePresentationOpen(Pres, "Normal");
@@ -192,11 +317,14 @@ namespace ppt_copier_addin
         {
             try
             {
+                // 检查并更新日期文件夹（跨天处理）
+                CheckAndUpdateDateFolder();
+
                 // 读取配置
                 var config = await ReadConfigAsync();
-                if (config == null || string.IsNullOrEmpty(config.TargetCopyPath))
+                if (config == null)
                 {
-                    LogMessage("配置文件不存在或目标路径未设置");
+                    LogMessage("配置文件不存在");
                     return;
                 }
 
@@ -223,8 +351,18 @@ namespace ppt_copier_addin
                 if (isRemovableDrive)
                 {
                     LogMessage($"检测到移动存储设备文件，开始复制: {documentPath}");
+
+                    // 获取可用的目标路径
+                    string targetPath = GetAvailableTargetPath(config.TargetCopyPath, config.UseFallbackOnError);
+
+                    if (string.IsNullOrEmpty(targetPath))
+                    {
+                        LogMessage("无法获取可用的目标路径，复制操作终止");
+                        return;
+                    }
+
                     // 执行复制操作
-                    await CopyFileToTargetAsync(documentPath, config.TargetCopyPath);
+                    await CopyFileToTargetAsync(documentPath, targetPath);
                 }
                 else
                 {
@@ -298,28 +436,33 @@ namespace ppt_copier_addin
                     string fileName = sourceFile.Name;
                     string fileHash = await ComputeFileHashAsync(sourcePath);
 
-                    // 创建按日期分文件夹的目标路径
-                    string dateFolder = DateTime.Now.ToString("yyyy-MM-dd");
-                    string targetFolder = Path.Combine(targetBasePath, dateFolder);
+                    // 使用当前日期文件夹（支持跨天）
+                    string targetFolder = Path.Combine(targetBasePath, currentDateFolder);
                     Directory.CreateDirectory(targetFolder);
 
                     string targetPath = Path.Combine(targetFolder, fileName);
 
                     // 检查是否需要复制（防重）
-                    bool shouldCopy = await CheckFileDuplicateAsync(dateFolder, fileName, fileHash);
+                    bool shouldCopy = await CheckFileDuplicateAsync(currentDateFolder, fileName, fileHash);
 
                     if (shouldCopy)
                     {
                         // 处理文件名冲突
                         targetPath = GetUniqueFilePath(targetPath);
 
-                        // 复制文件
-                        File.Copy(sourcePath, targetPath, true);
+                        // 复制文件，使用重试机制
+                        await CopyFileWithRetryAsync(sourcePath, targetPath);
 
                         // 记录文件状态
-                        await RecordFileStateAsync(dateFolder, fileName, fileHash, targetPath);
+                        await RecordFileStateAsync(currentDateFolder, fileName, fileHash, targetPath);
 
                         LogMessage($"文件复制成功: {sourcePath} -> {targetPath}");
+
+                        // 如果使用的是回退路径，记录警告
+                        if (targetBasePath == fallbackBackupPath)
+                        {
+                            LogMessage($"警告: 使用的是回退备份路径，请检查配置的目标路径是否可用");
+                        }
                     }
                     else
                     {
@@ -331,6 +474,31 @@ namespace ppt_copier_addin
                     LogMessage($"复制文件失败: {ex.Message}");
                 }
             });
+        }
+
+        /// <summary>
+        /// 带重试机制的文件复制
+        /// </summary>
+        private async Task CopyFileWithRetryAsync(string sourcePath, string targetPath, int maxRetries = 3)
+        {
+            int retryCount = 0;
+            while (retryCount < maxRetries)
+            {
+                try
+                {
+                    File.Copy(sourcePath, targetPath, true);
+                    return;
+                }
+                catch (IOException ex) when (retryCount < maxRetries - 1)
+                {
+                    retryCount++;
+                    LogMessage($"文件复制失败，正在重试 ({retryCount}/{maxRetries}): {ex.Message}");
+                    await Task.Delay(100 * retryCount); // 递增延迟
+                }
+            }
+
+            // 最后一次尝试
+            File.Copy(sourcePath, targetPath, true);
         }
 
         private async Task<string> ComputeFileHashAsync(string filePath)
@@ -486,7 +654,7 @@ namespace ppt_copier_addin
             try
             {
                 string logFile = Path.Combine(logFolderPath, $"PowerPointAutoCopy_{DateTime.Now:yyyyMMdd}.log");
-                
+
                 using (StreamWriter writer = new StreamWriter(logFile, true))
                 {
                     writer.WriteLine(logMessage);

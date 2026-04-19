@@ -32,5 +32,10 @@ namespace ppt_copier_addin
         /// 日志保留天数（默认7天）
         /// </summary>
         public int LogRetentionDays { get; set; } = 7;
+
+        /// <summary>
+        /// 当目标路径不可写入时是否使用回退路径
+        /// </summary>
+        public bool UseFallbackOnError { get; set; } = true;
     }
 }
