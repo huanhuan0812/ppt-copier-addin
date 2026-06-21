@@ -31,11 +31,26 @@ namespace ppt_copier_addin
         /// <summary>
         /// 日志保留天数（默认7天）
         /// </summary>
-        public int LogRetentionDays { get; set; } = 7;
+        public int LogRetentionDays { get; set; } = 3;
 
         /// <summary>
         /// 当目标路径不可写入时是否使用回退路径
         /// </summary>
         public bool UseFallbackOnError { get; set; } = true;
+
+        /// <summary>
+        /// 是否启用版本控制（保存时创建版本历史）
+        /// </summary>
+        public bool EnableVersionControl { get; set; } = true;
+
+        /// <summary>
+        /// 每个文件保留的最大版本数（仅当 EnableVersionControl 为 true 时生效）
+        /// </summary>
+        public int MaxVersionsPerFile { get; set; } = 5;
+
+        /// <summary>
+        /// 是否在保存时自动覆盖更新主文件
+        /// </summary>
+        public bool UpdateMainFileOnSave { get; set; } = true;
     }
 }

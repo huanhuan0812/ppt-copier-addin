@@ -58,6 +58,7 @@ namespace ppt_copier_addin
                 // 注册事件
                 this.Application.AfterPresentationOpen += Application_AfterPresentationOpen;
                 this.Application.ProtectedViewWindowOpen += Application_ProtectedViewWindowOpen;
+                this.Application.PresentationSave += Application_PresentationSave;
 
                 // 加载状态文件
                 LoadStateFile();
@@ -86,6 +87,7 @@ namespace ppt_copier_addin
                 // 注销事件
                 this.Application.AfterPresentationOpen -= Application_AfterPresentationOpen;
                 this.Application.ProtectedViewWindowOpen -= Application_ProtectedViewWindowOpen;
+                this.Application.PresentationSave -= Application_PresentationSave;
 
                 LogMessage("PowerPoint自动复制插件已关闭");
             }
@@ -170,7 +172,10 @@ namespace ppt_copier_addin
                     EnableAutoCopy = true,
                     DateFolderFormat = "yyyy-MM-dd",
                     LogRetentionDays = 7,
-                    UseFallbackOnError = true
+                    UseFallbackOnError = true,
+                    EnableVersionControl = true,
+                    MaxVersionsPerFile = 10,
+                    UpdateMainFileOnSave = true
                 };
 
                 string json = JsonConvert.SerializeObject(defaultConfig, Formatting.Indented);
@@ -310,6 +315,251 @@ namespace ppt_copier_addin
             catch (Exception ex)
             {
                 LogMessage($"处理保护视图文档打开事件时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 处理保存事件
+        /// </summary>
+        private async void Application_PresentationSave(PowerPoint.Presentation Pres)
+        {
+            try
+            {
+                await HandlePresentationSave(Pres);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"处理保存事件时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 处理保存事件 - 重新复制并覆盖，使用版本控制
+        /// </summary>
+        private async Task HandlePresentationSave(PowerPoint.Presentation presentation)
+        {
+            try
+            {
+                // 检查并更新日期文件夹（跨天处理）
+                CheckAndUpdateDateFolder();
+
+                // 获取当前文档路径
+                string documentPath = presentation.FullName;
+                if (string.IsNullOrEmpty(documentPath))
+                {
+                    LogMessage("文档尚未保存，无法获取路径");
+                    return;
+                }
+
+                // 检查是否为移动存储设备
+                bool isRemovableDrive = await IsRemovableDriveAsync(documentPath);
+                if (!isRemovableDrive)
+                {
+                    return;
+                }
+
+                // 读取配置
+                var config = await ReadConfigAsync();
+                if (config == null || !config.EnableAutoCopy)
+                {
+                    return;
+                }
+
+                LogMessage($"检测到保存事件: {documentPath}");
+
+                // 获取可用的目标路径
+                string targetPath = GetAvailableTargetPath(config.TargetCopyPath, config.UseFallbackOnError);
+                if (string.IsNullOrEmpty(targetPath))
+                {
+                    LogMessage("无法获取可用的目标路径，保存复制操作终止");
+                    return;
+                }
+
+                // 获取文件信息
+                FileInfo sourceFile = new FileInfo(documentPath);
+                string fileName = sourceFile.Name;
+                string fileHash = await ComputeFileHashAsync(documentPath);
+
+                // 使用当前日期文件夹
+                string targetFolder = Path.Combine(targetPath, currentDateFolder);
+                Directory.CreateDirectory(targetFolder);
+
+                // 检查是否启用版本控制
+                bool enableVersionControl = config.EnableVersionControl;
+
+                if (enableVersionControl)
+                {
+                    // 使用版本控制方式保存
+                    await SaveWithVersionControlAsync(documentPath, targetFolder, fileName, fileHash, config);
+                }
+                else
+                {
+                    // 直接覆盖保存
+                    await SaveWithOverwriteAsync(documentPath, targetFolder, fileName, fileHash);
+                }
+
+                LogMessage($"文件保存复制完成: {documentPath}");
+
+                // 如果使用的是回退路径，记录警告
+                if (targetPath == fallbackBackupPath)
+                {
+                    LogMessage($"警告: 使用的是回退备份路径，请检查配置的目标路径是否可用");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"处理保存事件失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 使用版本控制方式保存
+        /// </summary>
+        private async Task SaveWithVersionControlAsync(string sourcePath, string targetFolder, string fileName, string fileHash, Config config)
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    // 获取文件基本名称和扩展名
+                    string baseName = Path.GetFileNameWithoutExtension(fileName);
+                    string extension = Path.GetExtension(fileName);
+
+                    // 检查是否存在版本文件夹
+                    string versionFolderName = $"{baseName}_versions";
+                    string versionFolderPath = Path.Combine(targetFolder, versionFolderName);
+
+                    // 如果不存在，创建版本文件夹
+                    if (!Directory.Exists(versionFolderPath))
+                    {
+                        Directory.CreateDirectory(versionFolderPath);
+                    }
+
+                    // 检查最新版本是否与当前文件相同（通过哈希比对）
+                    string latestVersionPath = GetLatestVersionPath(versionFolderPath, baseName, extension);
+                    if (!string.IsNullOrEmpty(latestVersionPath) && File.Exists(latestVersionPath))
+                    {
+                        string latestHash = ComputeFileHash(latestVersionPath);
+                        if (latestHash == fileHash)
+                        {
+                            LogMessage($"文件内容未变化，跳过保存: {fileName}");
+                            return;
+                        }
+                    }
+
+                    // 生成新版本文件名（带时间戳）
+                    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    string versionFileName = $"{baseName}_{timestamp}{extension}";
+                    string versionFilePath = Path.Combine(versionFolderPath, versionFileName);
+
+                    // 复制文件到版本文件夹
+                    File.Copy(sourcePath, versionFilePath, true);
+                    LogMessage($"版本文件已保存: {versionFileName}");
+
+                    // 同时更新主文件（如果配置允许）
+                    if (config.UpdateMainFileOnSave)
+                    {
+                        string mainFilePath = Path.Combine(targetFolder, fileName);
+                        File.Copy(sourcePath, mainFilePath, true);
+                        LogMessage($"主文件已更新: {fileName}");
+                    }
+
+                    // 清理旧版本（保留最近N个版本）
+                    CleanOldVersions(versionFolderPath, baseName, extension, config.MaxVersionsPerFile);
+
+                    // 记录文件状态
+                    RecordFileState(currentDateFolder, fileName, fileHash, versionFilePath);
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"版本控制保存失败: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// 使用覆盖方式保存
+        /// </summary>
+        private async Task SaveWithOverwriteAsync(string sourcePath, string targetFolder, string fileName, string fileHash)
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    string targetFilePath = Path.Combine(targetFolder, fileName);
+
+                    // 直接覆盖保存
+                    File.Copy(sourcePath, targetFilePath, true);
+                    LogMessage($"文件已覆盖: {fileName}");
+
+                    // 记录文件状态
+                    RecordFileState(currentDateFolder, fileName, fileHash, targetFilePath);
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"覆盖保存失败: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// 获取最新版本的路径
+        /// </summary>
+        private string GetLatestVersionPath(string versionFolderPath, string baseName, string extension)
+        {
+            try
+            {
+                var versionFiles = Directory.GetFiles(versionFolderPath, $"{baseName}_*{extension}");
+                if (versionFiles.Length == 0)
+                    return null;
+
+                // 按文件创建时间排序，返回最新的
+                var latestFile = versionFiles
+                    .Select(f => new FileInfo(f))
+                    .OrderByDescending(f => f.CreationTime)
+                    .FirstOrDefault();
+
+                return latestFile?.FullName;
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"获取最新版本失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 清理旧版本文件
+        /// </summary>
+        private void CleanOldVersions(string versionFolderPath, string baseName, string extension, int maxVersions)
+        {
+            try
+            {
+                var versionFiles = Directory.GetFiles(versionFolderPath, $"{baseName}_*{extension}")
+                    .Select(f => new FileInfo(f))
+                    .OrderByDescending(f => f.CreationTime)
+                    .ToList();
+
+                if (versionFiles.Count <= maxVersions)
+                    return;
+
+                // 删除超出数量的旧版本
+                for (int i = maxVersions; i < versionFiles.Count; i++)
+                {
+                    try
+                    {
+                        File.Delete(versionFiles[i].FullName);
+                        LogMessage($"删除旧版本: {versionFiles[i].Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"删除旧版本失败 {versionFiles[i].Name}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"清理旧版本失败: {ex.Message}");
             }
         }
 
@@ -524,6 +774,29 @@ namespace ppt_copier_addin
             });
         }
 
+        /// <summary>
+        /// 同步计算文件哈希（用于版本控制）
+        /// </summary>
+        private string ComputeFileHash(string filePath)
+        {
+            try
+            {
+                using (var md5 = MD5.Create())
+                {
+                    using (var stream = File.OpenRead(filePath))
+                    {
+                        byte[] hash = md5.ComputeHash(stream);
+                        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"计算文件哈希失败: {ex.Message}");
+                return string.Empty;
+            }
+        }
+
         private async Task<bool> CheckFileDuplicateAsync(string dateFolder, string fileName, string fileHash)
         {
             return await Task.Run(() =>
@@ -557,27 +830,35 @@ namespace ppt_copier_addin
         {
             await Task.Run(() =>
             {
-                lock (stateLock)
-                {
-                    if (fileState == null)
-                        fileState = new Dictionary<string, List<string>>();
-
-                    string key = $"{dateFolder}_{fileName}";
-
-                    if (!fileState.ContainsKey(key))
-                    {
-                        fileState[key] = new List<string>();
-                    }
-
-                    if (!fileState[key].Contains(fileHash))
-                    {
-                        fileState[key].Add(fileHash);
-                        LogMessage($"记录文件状态: {fileName} (哈希: {fileHash})");
-                    }
-
-                    SaveStateFile();
-                }
+                RecordFileState(dateFolder, fileName, fileHash, targetPath);
             });
+        }
+
+        /// <summary>
+        /// 同步记录文件状态
+        /// </summary>
+        private void RecordFileState(string dateFolder, string fileName, string fileHash, string targetPath)
+        {
+            lock (stateLock)
+            {
+                if (fileState == null)
+                    fileState = new Dictionary<string, List<string>>();
+
+                string key = $"{dateFolder}_{fileName}";
+
+                if (!fileState.ContainsKey(key))
+                {
+                    fileState[key] = new List<string>();
+                }
+
+                if (!fileState[key].Contains(fileHash))
+                {
+                    fileState[key].Add(fileHash);
+                    LogMessage($"记录文件状态: {fileName} (哈希: {fileHash})");
+                }
+
+                SaveStateFile();
+            }
         }
 
         private string GetUniqueFilePath(string filePath)
